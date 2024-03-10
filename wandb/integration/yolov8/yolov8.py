@@ -2,8 +2,13 @@ from typing import Any, Callable, Dict, List, Optional
 
 from ultralytics.yolo.engine.model import YOLO
 from ultralytics.yolo.engine.trainer import BaseTrainer
-from ultralytics.yolo.utils import RANK
-from ultralytics.yolo.utils.torch_utils import get_flops, get_num_params
+
+try:
+    from ultralytics.yolo.utils import RANK
+    from ultralytics.yolo.utils.torch_utils import get_flops, get_num_params
+except ModuleNotFoundError:
+    from ultralytics.utils import RANK
+    from ultralytics.utils.torch_utils import get_flops, get_num_params
 from ultralytics.yolo.v8.classify.train import ClassificationTrainer
 
 import wandb
@@ -16,8 +21,11 @@ class WandbCallback:
     Usage:
     ```python
     from wandb.integration.yolov8.yolov8 import WandbCallback
+
     model = YOLO("yolov8n.pt")
-    wandb_logger = WandbCallback(model,)
+    wandb_logger = WandbCallback(
+        model,
+    )
     for event, callback_fn in wandb_logger.callbacks.items():
         model.add_callback(event, callback_fn)
     ```
@@ -69,6 +77,7 @@ class WandbCallback:
             )
         else:
             self.run = wandb.run
+        assert self.run is not None
         self.run.define_metric("epoch", hidden=True)
         self.run.define_metric(
             "train/*", step_metric="epoch", step_sync=True, summary="min"
@@ -89,6 +98,7 @@ class WandbCallback:
             tel.feature.ultralytics_yolov8 = True
 
     def on_pretrain_routine_end(self, trainer: BaseTrainer) -> None:
+        assert self.run is not None
         self.run.summary.update(
             {
                 "model/parameters": get_num_params(trainer.model),
@@ -99,10 +109,12 @@ class WandbCallback:
     def on_train_epoch_start(self, trainer: BaseTrainer) -> None:
         """On train epoch start we only log epoch number to the Weights & Biases run."""
         # We log the epoch number here to commit the previous step,
+        assert self.run is not None
         self.run.log({"epoch": trainer.epoch + 1})
 
     def on_train_epoch_end(self, trainer: BaseTrainer) -> None:
         """On train epoch end we log all the metrics to the Weights & Biases run."""
+        assert self.run is not None
         self.run.log(
             {
                 **trainer.metrics,
@@ -123,6 +135,7 @@ class WandbCallback:
 
     def on_fit_epoch_end(self, trainer: BaseTrainer) -> None:
         """On fit epoch end we log all the best metrics and model detail to Weights & Biases run summary."""
+        assert self.run is not None
         if trainer.epoch == 0:
             speeds = [
                 trainer.validator.speed.get(
@@ -148,7 +161,9 @@ class WandbCallback:
     def on_train_end(self, trainer: BaseTrainer) -> None:
         """On train end we log all the media, including plots, images and best model artifact to Weights & Biases."""
         # Currently only the detection and segmentation trainers save images to the save_dir
+        assert self.run is not None
         if not isinstance(trainer, ClassificationTrainer):
+            assert self.run is not None
             self.run.log(
                 {
                     "plots": [
@@ -163,6 +178,7 @@ class WandbCallback:
             )
 
         if trainer.best.exists():
+            assert self.run is not None
             self.run.log_artifact(
                 str(trainer.best),
                 type="model",
@@ -172,6 +188,7 @@ class WandbCallback:
 
     def on_model_save(self, trainer: BaseTrainer) -> None:
         """On model save we log the model as an artifact to Weights & Biases."""
+        assert self.run is not None
         self.run.log_artifact(
             str(trainer.last),
             type="model",
@@ -181,6 +198,7 @@ class WandbCallback:
 
     def teardown(self, _trainer: BaseTrainer) -> None:
         """On teardown, we finish the Weights & Biases run and set it to None."""
+        assert self.run is not None
         self.run.finish()
         self.run = None
 
@@ -222,14 +240,30 @@ def add_callbacks(
     Usage:
     ```python
     from wandb.integration.yolov8 import add_callbacks as add_wandb_callbacks
+
     model = YOLO("yolov8n.pt")
-    add_wandb_callbacks(model,)
-    model.train(data="coco128.yaml", epochs=3, imgsz=640,)
+    add_wandb_callbacks(
+        model,
+    )
+    model.train(
+        data="coco128.yaml",
+        epochs=3,
+        imgsz=640,
+    )
     ```
     """
     wandb.termwarn(
         """The wandb callback is currently in beta and is subject to change based on updates to `ultralytics yolov8`.
         The callback is tested and supported for ultralytics v8.0.43 and above.
+        Please report any issues to https://github.com/wandb/wandb/issues with the tag `yolov8`.
+        """,
+        repeat=False,
+    )
+    wandb.termwarn(
+        """This wandb callback is no longer functional and would be deprecated in the near future.
+        We recommend you to use the updated callback using `from wandb.integration.ultralytics import add_wandb_callback`.
+        The updated callback is tested and supported for ultralytics 8.0.167 and above.
+        You can refer to https://docs.wandb.ai/guides/integrations/ultralytics for the updated documentation.
         Please report any issues to https://github.com/wandb/wandb/issues with the tag `yolov8`.
         """,
         repeat=False,

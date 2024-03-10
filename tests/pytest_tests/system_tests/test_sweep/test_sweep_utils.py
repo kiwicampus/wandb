@@ -63,39 +63,55 @@ def test_sweep_construct_scheduler_args():
         "--queue",
         "'queue'",
         "--project",
-        "project",
-        "--sweep_type",
-        "sweep",
+        "'project'",
         "--job",
-        "job:12315",
+        "'job:12315'",
     ]
 
     args = utils.construct_scheduler_args(
-        {"job": "job:latest"}, "queue", "project", author="author"
+        {"job": "job:12315"},
+        "queue",
+        "project",
+        return_job=False,
     )
     assert args == [
         "--queue",
         "'queue'",
         "--project",
+        "'project'",
+        "--job",
+        "'job:12315'",
+    ]
+
+    args = utils.construct_scheduler_args(
+        {"job": "job:latest"},
+        "queue",
         "project",
-        "--sweep_type",
-        "sweep",
+        author="author",
+        return_job=False,
+    )
+    assert args == [
+        "--queue",
+        "'queue'",
+        "--project",
+        "'project'",
         "--author",
-        "author",
+        "'author'",
         "--job",
-        "job:latest",
+        "'job:latest'",
     ]
 
     args = utils.construct_scheduler_args(
-        {"image_uri": "image_uri"}, "queue", "project"
+        {"image_uri": "image_uri"},
+        "queue",
+        "project",
+        return_job=False,
     )
     assert args == [
         "--queue",
         "'queue'",
         "--project",
-        "project",
-        "--sweep_type",
-        "sweep",
+        "'project'",
         "--image_uri",
         "image_uri",
     ]
@@ -103,6 +119,9 @@ def test_sweep_construct_scheduler_args():
     # should fail because job and image_uri are mutually exclusive
     assert not (
         utils.construct_scheduler_args(
-            {"job": "job:111", "image_uri": "image_uri"}, "queue", "project"
+            {"job": "job:111", "image_uri": "image_uri"},
+            "queue",
+            "project",
+            return_job=False,
         )
     )

@@ -47,7 +47,8 @@ def monitor():
             import gym
         else:
             import gymnasium as gym  # type: ignore
-        from pkg_resources import parse_version
+
+        from wandb.util import parse_version
 
         if parse_version(gym.__version__) < parse_version("0.26.0"):
             _gym_version_lt_0_26 = True
@@ -65,12 +66,10 @@ def monitor():
         recorder.orig_close(self)
         if not self.enabled:
             return
-        m = re.match(r".+(video\.\d+).+", getattr(self, path))
-        if m:
-            key = m.group(1)
-        else:
-            key = "videos"
-        wandb.log({key: wandb.Video(getattr(self, path))})
+        if wandb.run:
+            m = re.match(r".+(video\.\d+).+", getattr(self, path))
+            key = m.group(1) if m else "videos"
+            wandb.log({key: wandb.Video(getattr(self, path))})
 
     def del_(self):
         self.orig_close()

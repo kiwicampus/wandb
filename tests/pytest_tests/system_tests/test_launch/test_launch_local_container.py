@@ -1,14 +1,19 @@
 from unittest.mock import MagicMock
 
+import pytest
 from wandb.apis.internal import Api
 from wandb.sdk.launch import loader
 from wandb.sdk.launch._project_spec import EntryPoint
 
 
-def test_local_container_entrypoint(relay_server, monkeypatch):
+@pytest.mark.asyncio
+async def test_local_container_entrypoint(relay_server, monkeypatch):
     def mock_run_entrypoint(*args, **kwargs):
         # return first arg, which is command
         return args[0]
+
+    async def mock_build_image(*args, **kwargs):
+        return "testimage"
 
     monkeypatch.setattr(
         "wandb.sdk.launch.runner.local_container._run_entry_point",
@@ -16,12 +21,16 @@ def test_local_container_entrypoint(relay_server, monkeypatch):
     )
 
     monkeypatch.setattr(
+        "wandb.sdk.launch.runner.local_container.docker_image_exists",
+        lambda x: None,
+    )
+    monkeypatch.setattr(
         "wandb.sdk.launch.runner.local_container.pull_docker_image",
         lambda x: None,
     )
     monkeypatch.setattr(
         "wandb.sdk.launch.builder.noop.NoOpBuilder.build_image",
-        lambda *args, **kwargs: "testimage",
+        mock_build_image,
     )
 
     with relay_server():
@@ -37,6 +46,7 @@ def test_local_container_entrypoint(relay_server, monkeypatch):
         project.target_project = project_name
         project.name = None
         project.run_id = "asdasd"
+        project.sweep_id = "sweeeeep"
         project.override_config = {}
         project.override_entrypoint = entrypoint
         project.get_single_entry_point.return_value = entrypoint
@@ -45,26 +55,27 @@ def test_local_container_entrypoint(relay_server, monkeypatch):
         project.image_name = "testimage"
         project.job = "testjob"
         project.launch_spec = {}
-        string_args = " ".join(project.override_args)
+        project.queue_name = "queue-name"
+        project.queue_entity = "queue-entity"
+        project.run_queue_item_id = None
         environment = loader.environment_from_config({})
-        registry = loader.registry_from_config({}, environment)
-        builder = loader.builder_from_config({"type": "noop"}, environment, registry)
         api = Api()
         runner = loader.runner_from_config(
             "local-container",
             api,
             {"type": "local-container", "SYNCHRONOUS": False},
             environment,
+            MagicMock(),
         )
-        command = runner.run(launch_project=project, builder=builder)
+        command = await runner.run(project, project.docker_image)
         assert (
             f"--entrypoint {entry_command[0]} {project.docker_image} {' '.join(entry_command[1:])}"
             in command
         )
 
         # test with no user provided image
-        project.docker_image = None
-        project.image_name = None
-        command = runner.run(launch_project=project, builder=builder)
-        assert f"WANDB_ARGS='{string_args}'" in command
-        assert f"WANDB_ARGS='{string_args}'" in command
+        command = await runner.run(project, project.docker_image)
+        assert (
+            f"--entrypoint {entry_command[0]} {project.docker_image} {' '.join(entry_command[1:])}"
+            in command
+        )

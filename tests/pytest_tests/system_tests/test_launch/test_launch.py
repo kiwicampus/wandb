@@ -5,11 +5,30 @@ import pytest
 import wandb
 from wandb.errors import CommError
 from wandb.sdk.internal.internal_api import Api as InternalApi
-from wandb.sdk.launch.launch import run
-from wandb.sdk.launch.utils import LaunchError
+from wandb.sdk.launch._launch import _launch
+from wandb.sdk.launch.builder.build import EntryPoint
+from wandb.sdk.launch.errors import LaunchError
 
 
-def test_launch_incorrect_backend(runner, user, monkeypatch, wandb_init, test_settings):
+class MockBuilder:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def verify(self):
+        pass
+
+    async def build_image(self, *args, **kwargs):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_launch_incorrect_backend(
+    runner, user, monkeypatch, wandb_init, test_settings
+):
+    launch_project = MagicMock()
+    launch_project.get_single_entry_point.return_value = EntryPoint(
+        "blah", ["python", "test.py"]
+    )
     proj = "test1"
     uri = "https://github.com/wandb/examples.git"
     entry_point = ["python", "/examples/examples/launch/launch-quickstart/train.py"]
@@ -17,8 +36,9 @@ def test_launch_incorrect_backend(runner, user, monkeypatch, wandb_init, test_se
     api = InternalApi()
 
     monkeypatch.setattr(
-        "wandb.sdk.launch.launch.fetch_and_validate_project",
-        lambda _1, _2: "something",
+        wandb.sdk.launch.builder.build,
+        "LaunchProject",
+        lambda *args, **kwargs: MagicMock(),
     )
 
     monkeypatch.setattr(
@@ -33,15 +53,17 @@ def test_launch_incorrect_backend(runner, user, monkeypatch, wandb_init, test_se
     )
     monkeypatch.setattr(
         "wandb.sdk.launch.loader.environment_from_config",
-        lambda *args, **kawrgs: MagicMock(),
+        lambda *args, **kawrgs: None,
     )
-    monkeypatch.setattr(
-        "wandb.sdk.launch.loader.registry_from_config",
-        lambda *args, **kawrgs: MagicMock(),
+    (
+        monkeypatch.setattr(
+            "wandb.sdk.launch.loader.registry_from_config", lambda *args, **kawrgs: None
+        ),
     )
+
     monkeypatch.setattr(
         "wandb.sdk.launch.loader.builder_from_config",
-        lambda *args, **kawrgs: MagicMock(),
+        lambda *args, **kawrgs: MockBuilder(),
     )
     r = wandb_init(settings=settings)
     r.finish()
@@ -49,7 +71,7 @@ def test_launch_incorrect_backend(runner, user, monkeypatch, wandb_init, test_se
         LaunchError,
         match="Could not create runner from config. Invalid runner name: testing123",
     ):
-        run(
+        await _launch(
             api,
             uri=uri,
             entity=user,
@@ -97,3 +119,27 @@ def test_launch_get_project_queue_error(user):
         match=f"Error fetching run queues for {user}/{proj} check that you have access to this entity and project",
     ):
         api.get_project_run_queues(user, proj)
+
+
+def test_launch_wandb_init_launch_envs(
+    relay_server, runner, user, wandb_init, test_settings
+):
+    queue = "test-queue-name"
+    with runner.isolated_filesystem(), mock.patch.dict(
+        "os.environ",
+        {
+            "WANDB_LAUNCH_QUEUE_NAME": queue,
+            "WANDB_LAUNCH_QUEUE_ENTITY": user,
+            "WANDB_LAUNCH_TRACE_ID": "test123",
+        },
+    ):
+        with relay_server() as relay:
+            run = wandb_init()
+            run.log({"test": 1})
+            run.finish()
+
+        config = relay.context.config[run.id]
+
+        assert config["_wandb"]["value"]["launch_trace_id"] == "test123"
+        assert config["_wandb"]["value"]["launch_queue_entity"] == user
+        assert config["_wandb"]["value"]["launch_queue_name"] == queue

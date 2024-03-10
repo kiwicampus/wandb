@@ -111,7 +111,7 @@ def test_login_timeout_env_blank(mock_tty):
 def test_login_timeout_env_invalid(mock_tty):
     mock_tty("")
     with mock.patch.dict(os.environ, {"WANDB_LOGIN_TIMEOUT": "junk"}):
-        with pytest.raises(ValueError):
+        with pytest.raises(wandb.sdk.wandb_settings.SettingsPreprocessingError):
             wandb.login()
 
 
@@ -159,9 +159,8 @@ def test_login_sets_api_base_url(local_settings):
         assert api.settings["base_url"] == base_url
 
 
-@pytest.mark.skip(reason="We dont validate keys in `wandb.login()` right now")
 def test_login_invalid_key():
-    with mock.patch.dict("os.environ", WANDB_API_KEY="B" * 40):
+    with mock.patch.dict("os.environ", WANDB_API_KEY="X" * 40):
         wandb.ensure_configured()
-        with pytest.raises(wandb.UsageError):
-            wandb.login()
+        with pytest.raises(wandb.errors.AuthenticationError):
+            wandb.login(verify=True)

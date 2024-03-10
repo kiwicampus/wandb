@@ -22,7 +22,6 @@ import json
 import logging
 import os
 import pprint
-import tempfile
 from decimal import Decimal
 from typing import Optional
 
@@ -31,6 +30,7 @@ from wandb import util
 from wandb.sdk.lib import filesystem
 
 from .sdk.data_types import _dtypes
+from .sdk.data_types._private import MEDIA_TMP
 from .sdk.data_types.base_types.media import (
     BatchableMedia,
     Media,
@@ -47,6 +47,7 @@ from .sdk.data_types.molecule import Molecule
 from .sdk.data_types.object_3d import Object3D
 from .sdk.data_types.plotly import Plotly
 from .sdk.data_types.saved_model import _SavedModel
+from .sdk.data_types.trace_tree import WBTraceTree
 from .sdk.data_types.video import Video
 from .sdk.lib import runid
 
@@ -67,17 +68,13 @@ __all__ = [
     "Object3D",
     "Plotly",
     "Video",
+    "WBTraceTree",
     "_SavedModel",
     # Typed Legacy Exports (I'd like to remove these)
     "ImageMask",
     "BoundingBoxes2D",
     "Classes",
 ]
-
-
-# Staging directory, so we can encode raw data into files, then hash them before
-# we put them into the Run directory to be uploaded.
-MEDIA_TMP = tempfile.TemporaryDirectory("wandb-media")
 
 
 class _TableLinkMixin:
@@ -161,74 +158,6 @@ class Table(Media):
     This class is the primary class used to generate the Table Visualizer
     in the UI: https://docs.wandb.ai/guides/data-vis/tables.
 
-    Tables can be constructed with initial data using the `data` or
-    `dataframe` parameters:
-    <!--yeadoc-test:table-construct-dataframe-->
-    ```python
-    import pandas as pd
-    import wandb
-
-    data = {"users": ["geoff", "juergen", "ada"], "feature_01": [1, 117, 42]}
-    df = pd.DataFrame(data)
-
-    tbl = wandb.Table(data=df)
-    assert all(tbl.get_column("users") == df["users"])
-    assert all(tbl.get_column("feature_01") == df["feature_01"])
-    ```
-
-    Additionally, users can add data to Tables incrementally by using the
-    `add_data`, `add_column`, and `add_computed_column` functions for
-    adding rows, columns, and columns computed from data in other columns, respectively:
-    <!--yeadoc-test:table-construct-rowwise-->
-    ```python
-    import wandb
-
-    tbl = wandb.Table(columns=["user"])
-
-    users = ["geoff", "juergen", "ada"]
-
-    [tbl.add_data(user) for user in users]
-    assert tbl.get_column("user") == users
-
-
-    def get_user_name_length(index, row):
-        return {"feature_01": len(row["user"])}
-
-
-    tbl.add_computed_columns(get_user_name_length)
-    assert tbl.get_column("feature_01") == [5, 7, 3]
-    ```
-
-    Tables can be logged directly to runs using `run.log({"my_table": table})`
-    or added to artifacts using `artifact.add(table, "my_table")`:
-    <!--yeadoc-test:table-logging-direct-->
-    ```python
-    import numpy as np
-    import wandb
-
-    wandb.init()
-
-    tbl = wandb.Table(columns=["image", "label"])
-
-    images = np.random.randint(0, 255, [2, 100, 100, 3], dtype=np.uint8)
-    labels = ["panda", "gibbon"]
-    [tbl.add_data(wandb.Image(image), label) for image, label in zip(images, labels)]
-
-    wandb.log({"classifier_out": tbl})
-    ```
-
-    Tables added directly to runs as above will produce a corresponding Table Visualizer in the
-    Workspace which can be used for further analysis and exporting to reports.
-
-    Tables added to artifacts can be viewed in the Artifact Tab and will render
-    an equivalent Table Visualizer directly in the artifact browser.
-
-    Tables expect each value for a column to be of the same type. By default, a column supports
-    optional values, but not mixed values. If you absolutely need to mix types,
-    you can enable the `allow_mixed_types` flag which will disable type checking
-    on the data. This will result in some table analytics features being disabled
-    due to lack of consistent typing.
-
     Arguments:
         columns: (List[str]) Names of the columns in the table.
             Defaults to ["Input", "Output", "Expected"].
@@ -260,9 +189,10 @@ class Table(Media):
         optional=True,
         allow_mixed_types=False,
     ):
-        """Initialize a Table object.
+        """Initializes a Table object.
 
-        Rows is kept for legacy reasons, we use data to mimic the Pandas api.
+        The rows is availble for legacy reasons and should not be used.
+        The Table class uses data to mimic the Pandas API.
         """
         super().__init__()
         self._pk_col = None
@@ -298,13 +228,13 @@ class Table(Media):
     @staticmethod
     def _assert_valid_columns(columns):
         valid_col_types = [str, int]
-        assert type(columns) is list, "columns argument expects a `list` object"
+        assert isinstance(columns, list), "columns argument expects a `list` object"
         assert len(columns) == 0 or all(
             [type(col) in valid_col_types for col in columns]
         ), "columns argument expects list of strings or ints"
 
     def _init_from_list(self, data, columns, optional=True, dtype=None):
-        assert type(data) is list, "data argument expects a `list` object"
+        assert isinstance(data, list), "data argument expects a `list` object"
         self.data = []
         self._assert_valid_columns(columns)
         self.columns = columns
@@ -350,13 +280,12 @@ class Table(Media):
             self.cast(col_name, dt, opt)
 
     def cast(self, col_name, dtype, optional=False):
-        """Cast a column to a specific type.
+        """Casts a column to a specific data type. This can be one of the normal python classes, an internal W&B type, or an example objec, like an instance of wandb.Image or wandb.Classes.
 
         Arguments:
-            col_name: (str) - name of the column to cast
-            dtype: (class, wandb.wandb_sdk.interface._dtypes.Type, any) - the target dtype. Can be one of
-                normal python class, internal WB type, or an example object (e.g. an instance of wandb.Image or wandb.Classes)
-            optional: (bool) - if the column should allow Nones
+            col_name: (str) - The name of the column to cast.
+            dtype: (class, wandb.wandb_sdk.interface._dtypes.Type, any) - The target dtype.
+            optional: (bool) - If the column should allow Nones.
         """
         assert col_name in self.columns
 
@@ -386,10 +315,10 @@ class Table(Media):
         if is_pk or is_fk or is_fi:
             assert (
                 not optional
-            ), "Primary keys, foreign keys, and foreign indexes cannot be optional"
+            ), "Primary keys, foreign keys, and foreign indexes cannot be optional."
 
         if (is_fk or is_fk) and id(wbtype.params["table"]) == id(self):
-            raise AssertionError("Cannot set a foreign table reference to same table")
+            raise AssertionError("Cannot set a foreign table reference to same table.")
 
         if is_pk:
             assert (
@@ -451,14 +380,14 @@ class Table(Media):
         return self._eq_debug(other)
 
     def add_row(self, *row):
-        """Deprecated: use add_data instead."""
+        """Deprecated; use add_data instead."""
         logging.warning("add_row is deprecated, use add_data")
         self.add_data(*row)
 
     def add_data(self, *data):
-        """Add a row of data to the table.
+        """Adds a new row of data to the table. The maximum amount of rows in a table is determined by `wandb.Table.MAX_ARTIFACT_ROWS`.
 
-        Argument length should match column length.
+        The length of the data should match the length of the table column.
         """
         if len(data) != len(self.columns):
             raise ValueError(
@@ -491,7 +420,7 @@ class Table(Media):
         self._update_keys(force_last=True)
 
     def _get_updated_result_type(self, row):
-        """Return an updated result type based on incoming row.
+        """Returns the updated result type based on the inputted row.
 
         Raises:
             TypeError: if the assignment is invalid.
@@ -579,10 +508,10 @@ class Table(Media):
                     serialization_path = ndarray_type._get_serialization_path()
                     np = util.get_module(
                         "numpy",
-                        required="Deserializing numpy columns requires numpy to be installed",
+                        required="Deserializing NumPy columns requires NumPy to be installed.",
                     )
                     deserialized = np.load(
-                        source_artifact.get_path(serialization_path["path"]).download()
+                        source_artifact.get_entry(serialization_path["path"]).download()
                     )
                     np_deserialized_columns[
                         json_obj["columns"].index(col_name)
@@ -633,7 +562,7 @@ class Table(Media):
                 }
             )
 
-        elif isinstance(run_or_artifact, wandb.wandb_sdk.wandb_artifacts.Artifact):
+        elif isinstance(run_or_artifact, wandb.Artifact):
             artifact = run_or_artifact
             mapped_data = []
             data = self._to_table_json(Table.MAX_ARTIFACT_ROWS)["data"]
@@ -654,7 +583,7 @@ class Table(Media):
                 is_1d_array = (
                     ndarray_type is not None
                     and "shape" in ndarray_type._params
-                    and type(ndarray_type._params["shape"]) == list
+                    and isinstance(ndarray_type._params["shape"], list)
                     and len(ndarray_type._params["shape"]) == 1
                     and ndarray_type._params["shape"][0]
                     <= self._MAX_EMBEDDING_DIMENSIONS
@@ -666,7 +595,7 @@ class Table(Media):
                 elif ndarray_type is not None:
                     np = util.get_module(
                         "numpy",
-                        required="Serializing numpy requires numpy to be installed",
+                        required="Serializing NumPy requires NumPy to be installed.",
                     )
                     file_name = f"{str(col_name)}_{runid.generate_id()}.npz"
                     npz_file_name = os.path.join(MEDIA_TMP.name, file_name)
@@ -707,12 +636,12 @@ class Table(Media):
         return json_dict
 
     def iterrows(self):
-        """Iterate over rows as (ndx, row).
+        """Returns the table data by row, showing the index of the row and the relevant data.
 
         Yields:
         ------
         index : int
-            The index of the row. Using this value in other WandB tables
+            The index of the row. Using this value in other W&B tables
             will automatically build a relationship between the tables
         row : List[any]
             The data of the row.
@@ -734,13 +663,13 @@ class Table(Media):
         self.cast(col_name, _ForeignKeyType(table, table_col))
 
     def _update_keys(self, force_last=False):
-        """Update the known key-like columns based on the current column types.
+        """Updates the known key-like columns based on current column types.
 
-        If the state has been updated since the last update, we wrap the data
+        If the state has been updated since the last update, wraps the data
         appropriately in the Key classes.
 
         Arguments:
-            force_last: (bool) Determines wrapping the last column of data even if there
+            force_last: (bool) Wraps the last column of data even if there
                 are no key updates.
         """
         _pk_col = None
@@ -781,7 +710,7 @@ class Table(Media):
             self._apply_key_updates(not has_update)
 
     def _apply_key_updates(self, only_last=False):
-        """Appropriately wrap the underlying data in special key classes.
+        """Appropriately wraps the underlying data in special Key classes.
 
         Arguments:
             only_last: only apply the updates to the last row (used for performance when
@@ -830,7 +759,7 @@ class Table(Media):
                 update_row(row_ndx)
 
     def add_column(self, name, data, optional=False):
-        """Add a column of data to the table.
+        """Adds a column of data to the table.
 
         Arguments:
             name: (str) - the unique name of the column
@@ -871,7 +800,7 @@ class Table(Media):
             raise err
 
     def get_column(self, name, convert_to=None):
-        """Retrieve a column of data from the table.
+        """Retrieves a column from the table and optionally converts it to a NumPy object.
 
         Arguments:
             name: (str) - the name of the column
@@ -882,7 +811,7 @@ class Table(Media):
         assert convert_to is None or convert_to == "numpy"
         if convert_to == "numpy":
             np = util.get_module(
-                "numpy", required="Converting to numpy requires installing numpy"
+                "numpy", required="Converting to NumPy requires installing NumPy"
             )
         col = []
         col_ndx = self.columns.index(name)
@@ -896,7 +825,7 @@ class Table(Media):
         return col
 
     def get_index(self):
-        """Return an array of row indexes for use in other tables to create links."""
+        """Returns an array of row indexes for use in other tables to create links."""
         ndxs = []
         for ndx in range(len(self.data)):
             index = _TableIndex(ndx)
@@ -905,7 +834,7 @@ class Table(Media):
         return ndxs
 
     def get_dataframe(self):
-        """Returns a pandas.DataFrame of the table."""
+        """Returns a `pandas.DataFrame` of the table."""
         pd = util.get_module(
             "pandas",
             required="Converting to pandas.DataFrame requires installing pandas",
@@ -913,14 +842,14 @@ class Table(Media):
         return pd.DataFrame.from_records(self.data, columns=self.columns)
 
     def index_ref(self, index):
-        """Get a reference to a particular row index in the table."""
+        """Gets a reference of the index of a row in the table."""
         assert index < len(self.data)
         _index = _TableIndex(index)
         _index.set_table(self)
         return _index
 
     def add_computed_columns(self, fn):
-        """Add one or more computed columns based on existing data.
+        """Adds one or more computed columns based on existing data.
 
         Args:
             fn: A function which accepts one or two parameters, ndx (int) and row (dict),
@@ -1098,7 +1027,7 @@ class Audio(BatchableMedia):
     @classmethod
     def from_json(cls, json_obj, source_artifact):
         return cls(
-            source_artifact.get_path(json_obj["path"]).download(),
+            source_artifact.get_entry(json_obj["path"]).download(),
             caption=json_obj["caption"],
         )
 
@@ -1252,7 +1181,7 @@ class JoinedTable(Media):
     def _validate_table_input(table):
         """Helper method to validate that the table input is one of the 3 supported types."""
         return (
-            (type(table) == str and table.endswith(".table.json"))
+            (isinstance(table, str) and table.endswith(".table.json"))
             or isinstance(table, Table)
             or isinstance(table, PartitionedTable)
             or (hasattr(table, "ref_url") and table.ref_url().endswith(".table.json"))
@@ -1381,7 +1310,7 @@ class Bokeh(Media):
 
     @classmethod
     def from_json(cls, json_obj, source_artifact):
-        return cls(source_artifact.get_path(json_obj["path"]).download())
+        return cls(source_artifact.get_entry(json_obj["path"]).download())
 
 
 def _nest(thing):
@@ -1397,14 +1326,14 @@ def _nest(thing):
 class Graph(Media):
     """Wandb class for graphs.
 
-    This class is typically used for saving and diplaying neural net models.  It
+    This class is typically used for saving and displaying neural net models.  It
     represents the graph as an array of nodes and edges.  The nodes can have
     labels that can be visualized by wandb.
 
     Examples:
         Import a keras model:
         ```
-            Graph.from_keras(keras_model)
+        Graph.from_keras(keras_model)
         ```
 
     Attributes:
@@ -1472,9 +1401,7 @@ class Graph(Media):
             node = Node(**node_kwargs)
         elif node_kwargs:
             raise ValueError(
-                "Only pass one of either node ({node}) or other keyword arguments ({node_kwargs})".format(
-                    node=node, node_kwargs=node_kwargs
-                )
+                f"Only pass one of either node ({node}) or other keyword arguments ({node_kwargs})"
             )
         self.nodes.append(node)
         self.nodes_by_id[node.id] = node

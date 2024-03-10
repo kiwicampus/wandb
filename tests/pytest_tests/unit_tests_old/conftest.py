@@ -35,7 +35,7 @@ from wandb.sdk.internal.internal_api import Api as InternalApi
 from wandb.sdk.internal.sender import SendManager
 from wandb.sdk.internal.writer import WriteManager
 from wandb.sdk.lib import filesystem, runid
-from wandb.sdk.lib.git import GitRepo
+from wandb.sdk.lib.gitlib import GitRepo
 from wandb.sdk.lib.mailbox import Mailbox
 from wandb.sdk.lib.module import unset_globals
 
@@ -61,8 +61,7 @@ servers = ServerMap()
 
 
 def get_temp_dir_kwargs(tmp_path):
-    # Click>=8 implements temp_dir argument which depends on python>=3.7
-    return dict(temp_dir=tmp_path) if sys.version_info >= (3, 7) else {}
+    return dict(temp_dir=tmp_path)
 
 
 def test_cleanup(*args, **kwargs):
@@ -284,6 +283,15 @@ def test_settings(test_dir, mocker, live_mock_server):
 @pytest.fixture
 def mocked_run(runner, test_settings):
     """A managed run object for tests with a mock backend"""
+    run = wandb.wandb_sdk.wandb_run.Run(settings=test_settings)
+    run._set_backend(MagicMock())
+    yield run
+
+
+@pytest.fixture
+def mocked_run_disable_job_creation(runner, test_settings):
+    """A managed run object for tests with a mock backend"""
+    test_settings.update({"disable_job_creation": True})
     run = wandb.wandb_sdk.wandb_run.Run(settings=test_settings)
     run._set_backend(MagicMock())
     yield run
@@ -787,9 +795,12 @@ def _start_backend(
         wt = start_write_thread(internal_wm)
         st = start_send_thread(internal_sm)
         if initial_run:
-            run = _internal_sender.communicate_run(mocked_run)
+            handle = _internal_sender.deliver_run(mocked_run)
+            result = handle.wait(timeout=10)
+            run_result = result.run_result
             if initial_start:
-                _internal_sender.communicate_run_start(run.run)
+                handle = _internal_sender.deliver_run_start(run_result.run)
+                handle.wait(timeout=10)
         return (ht, wt, st)
 
     yield start_backend_func

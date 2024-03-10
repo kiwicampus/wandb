@@ -3,8 +3,6 @@ import itertools
 import textwrap
 from typing import Callable, List, Mapping, Optional
 
-from pkg_resources import parse_version
-
 import wandb
 
 try:
@@ -12,6 +10,8 @@ try:
     from kfp.components import structures
     from kfp.components._components import _create_task_factory_from_component_spec
     from kfp.components._python_op import _func_to_component_spec
+
+    from wandb.util import parse_version
 
     MIN_KFP_VERSION = "1.6.1"
 
@@ -169,8 +169,8 @@ def _get_function_source_definition(func: Callable) -> str:
 
     if not func_code_lines:
         raise ValueError(
-            'Failed to dedent and clean up the source of function "{}". '
-            "It is probably not properly indented.".format(func.__name__)
+            f'Failed to dedent and clean up the source of function "{func.__name__}". '
+            "It is probably not properly indented."
         )
 
     return "\n".join(func_code_lines)

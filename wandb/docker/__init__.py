@@ -82,10 +82,28 @@ def is_buildx_installed() -> bool:
     return _buildx_installed
 
 
+def is_docker_installed() -> bool:
+    """Return `True` if docker is installed and working, else `False`."""
+    try:
+        # Run the docker --version command
+        result = subprocess.run(
+            ["docker", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        if result.returncode == 0:
+            return True
+        else:
+            return False
+    except FileNotFoundError:
+        # If docker command is not found
+        return False
+
+
 def build(
     tags: List[str], file: str, context_path: str, platform: Optional[str] = None
 ) -> str:
-    command = ["buildx", "build"] if is_buildx_installed() else ["build"]
+    use_buildx = is_buildx_installed()
+    command = ["buildx", "build"] if use_buildx else ["build"]
+    command += ["--load"] if should_add_load_argument(platform) and use_buildx else []
     if platform:
         command += ["--platform", platform]
     build_tags = []
@@ -96,6 +114,14 @@ def build(
         args,
     )
     return stdout
+
+
+def should_add_load_argument(platform: Optional[str]) -> bool:
+    # the load option does not work when multiple platforms are specified:
+    # https://github.com/docker/buildx/issues/59
+    if platform is None or (platform and "," not in platform):
+        return True
+    return False
 
 
 def run_command_live_output(args: List[Any]) -> str:
@@ -220,9 +246,7 @@ def auth_token(registry: str, repo: str) -> Dict[str, str]:
             info = {}
     else:
         log.error(
-            "Received {} when attempting to authenticate with {}".format(
-                response, registry
-            )
+            f"Received {response} when attempting to authenticate with {registry}"
         )
         info = {}
     if info.get("bearer"):
@@ -306,6 +330,7 @@ __all__ = [
     "run",
     "image_id",
     "image_id_from_registry",
+    "is_docker_installed",
     "auth_token",
     "parse",
     "parse_repository_tag",
