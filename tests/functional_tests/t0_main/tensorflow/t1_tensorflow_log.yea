@@ -1,7 +1,13 @@
 id: 0.tf.01-tensorflow-log
 plugin:
     - wandb
-
+depend:
+  requirements:
+    - tensorboard
+tag:
+  shard: tf
+  skips:
+    - platform: win
 assert:
     - :wandb:runs_len: 1
     - :wandb:runs[0][config]: {}

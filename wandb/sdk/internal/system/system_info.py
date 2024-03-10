@@ -12,13 +12,8 @@ from urllib.parse import unquote
 
 from wandb.sdk.internal.settings_static import SettingsStatic
 from wandb.sdk.lib import filesystem
-from wandb.sdk.lib.filenames import (
-    CONDA_ENVIRONMENTS_FNAME,
-    DIFF_FNAME,
-    METADATA_FNAME,
-    REQUIREMENTS_FNAME,
-)
-from wandb.sdk.lib.git import GitRepo
+from wandb.sdk.lib.filenames import CONDA_ENVIRONMENTS_FNAME, DIFF_FNAME, METADATA_FNAME
+from wandb.sdk.lib.gitlib import GitRepo
 
 from .assets.interfaces import Interface
 
@@ -35,7 +30,7 @@ class SystemInfo:
         self.backend_interface = interface
         self.git = GitRepo(
             root=self.settings.git_root,
-            remote=self.settings.git_remote,  # type: ignore
+            remote=self.settings.git_remote,
             remote_url=self.settings.git_remote_url,
             commit=self.settings.git_commit,
         )
@@ -45,49 +40,9 @@ class SystemInfo:
         self.saved_patches: List[str] = []
         logger.debug("System info init done")
 
-    # todo: refactor these _save_* methods
-    def _save_pip(self) -> None:
-        """Save the current working set of pip packages to {REQUIREMENTS_FNAME}."""
-        logger.debug(
-            "Saving list of pip packages installed into the current environment"
-        )
-        try:
-            import pkg_resources
-
-            installed_packages = [d for d in iter(pkg_resources.working_set)]
-            installed_packages_list = sorted(
-                f"{i.key}=={i.version}" for i in installed_packages
-            )
-            with open(
-                os.path.join(self.settings.files_dir, REQUIREMENTS_FNAME), "w"
-            ) as f:
-                f.write("\n".join(installed_packages_list))
-        except Exception as e:
-            logger.exception(f"Error saving pip packages: {e}")
-        logger.debug("Saving pip packages done")
-
-    def _save_conda(self) -> None:
-        current_shell_is_conda = os.path.exists(os.path.join(sys.prefix, "conda-meta"))
-        if not current_shell_is_conda:
-            return None
-
-        logger.debug(
-            "Saving list of conda packages installed into the current environment"
-        )
-        try:
-            with open(
-                os.path.join(self.settings.files_dir, CONDA_ENVIRONMENTS_FNAME), "w"
-            ) as f:
-                subprocess.call(
-                    ["conda", "env", "export"], stdout=f, stderr=subprocess.DEVNULL
-                )
-        except Exception as e:
-            logger.exception(f"Error saving conda packages: {e}")
-        logger.debug("Saving conda packages done")
-
     def _save_code(self) -> None:
         logger.debug("Saving code")
-        if self.settings.program_relpath is None:
+        if not self.settings.program_relpath:
             logger.warning("unable to save code -- program entry not found")
             return None
 
@@ -142,8 +97,8 @@ class SystemInfo:
                         os.path.relpath(patch_path, start=self.settings.files_dir)
                     )
 
-            upstream_commit = self.git.get_upstream_fork_point()  # type: ignore
-            if upstream_commit and upstream_commit != self.git.repo.head.commit:
+            upstream_commit = self.git.get_upstream_fork_point()
+            if upstream_commit and upstream_commit != self.git.repo.head.commit:  # type: ignore
                 sha = upstream_commit.hexsha
                 upstream_patch_path = os.path.join(
                     self.settings.files_dir, f"upstream_diff_{sha}.patch"
@@ -205,13 +160,16 @@ class SystemInfo:
         data["docker"] = self.settings.docker
 
         data["cuda"] = self.settings._cuda
-        data["args"] = self.settings._args
+        data["args"] = tuple(self.settings._args or ())
         data["state"] = "running"
 
         if self.settings.program is not None:
             data["program"] = self.settings.program
+            # Used during artifact-job creation, always points to the relpath
+            # of code execution, even when in a git repo
+            data["codePathLocal"] = self.settings._code_path_local
         if not self.settings.disable_code:
-            if self.settings.program_relpath is not None:
+            if self.settings.program_relpath:
                 data["codePath"] = self.settings.program_relpath
             elif self.settings._jupyter:
                 if self.settings.notebook_name:
@@ -241,10 +199,28 @@ class SystemInfo:
 
         return data
 
+    def _save_conda(self) -> None:
+        current_shell_is_conda = os.path.exists(os.path.join(sys.prefix, "conda-meta"))
+        if not current_shell_is_conda:
+            return None
+
+        logger.debug(
+            "Saving list of conda packages installed into the current environment"
+        )
+        try:
+            with open(
+                os.path.join(self.settings.files_dir, CONDA_ENVIRONMENTS_FNAME), "w"
+            ) as f:
+                subprocess.call(
+                    ["conda", "env", "export"], stdout=f, stderr=subprocess.DEVNULL
+                )
+        except Exception as e:
+            logger.exception(f"Error saving conda packages: {e}")
+        logger.debug("Saving conda packages done")
+
     def publish(self, system_info: dict) -> None:
         # save pip, conda, code patches to disk
         if self.settings._save_requirements:
-            self._save_pip()
             self._save_conda()
         if self.settings.save_code:
             self._save_code()

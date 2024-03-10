@@ -1,13 +1,35 @@
+import sys
 from unittest import mock
 
 import pytest
 import wandb
 from wandb import Api
+from wandb.sdk.artifacts.artifact_download_logger import ArtifactDownloadLogger
+from wandb.sdk.internal.thread_local_settings import _thread_local_api_settings
 
 
 def test_api_auto_login_no_tty():
-    with pytest.raises(wandb.UsageError):
-        Api()
+    with mock.patch.object(sys, "stdin", None):
+        with pytest.raises(wandb.UsageError):
+            Api()
+
+
+def test_thread_local_cookies():
+    try:
+        _thread_local_api_settings.cookies = {"foo": "bar"}
+        api = Api()
+        assert api._base_client.transport.cookies == {"foo": "bar"}
+    finally:
+        _thread_local_api_settings.cookies = None
+
+
+def test_thread_local_api_key():
+    try:
+        _thread_local_api_settings.api_key = "XXXX"
+        api = Api()
+        assert api.api_key == "XXXX"
+    finally:
+        _thread_local_api_settings.api_key = None
 
 
 @pytest.mark.usefixtures("patch_apikey", "patch_prompt")
@@ -38,8 +60,8 @@ def test_parse_path(path):
 @pytest.mark.usefixtures("patch_apikey", "patch_prompt")
 def test_parse_project_path():
     with mock.patch.object(wandb, "login", mock.MagicMock()):
-        enitty, project = Api()._parse_project_path("user/proj")
-        assert enitty == "user"
+        entity, project = Api()._parse_project_path("user/proj")
+        assert entity == "user"
         assert project == "proj"
 
 
@@ -76,6 +98,17 @@ def test_parse_path_proj():
         assert user == "mock_entity"
         assert project == "proj"
         assert run == "proj"
+
+
+@pytest.mark.usefixtures("patch_apikey", "patch_prompt")
+def test_parse_path_id():
+    with mock.patch.dict(
+        "os.environ", {"WANDB_ENTITY": "mock_entity", "WANDB_PROJECT": "proj"}
+    ):
+        user, project, run = Api()._parse_path("run")
+        assert user == "mock_entity"
+        assert project == "proj"
+        assert run == "run"
 
 
 @pytest.mark.usefixtures("patch_apikey", "patch_prompt")
@@ -121,7 +154,7 @@ def test_artifact_download_logger():
     termlog = mock.Mock()
 
     nfiles = 10
-    logger = wandb.apis.public._ArtifactDownloadLogger(
+    logger = ArtifactDownloadLogger(
         nfiles=nfiles,
         clock_for_testing=lambda: now,
         termlog_for_testing=termlog,

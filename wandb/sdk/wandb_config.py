@@ -202,13 +202,17 @@ class Config:
         if self._callback:
             self._callback(data=d)
 
-    def update_locked(self, d, user=None, _allow_val_change=None):
+    def _get_user_id(self, user) -> int:
         if user not in self._users:
             self._users[user] = self._users_cnt
             self._users_inv[self._users_cnt] = user
             object.__setattr__(self, "_users_cnt", self._users_cnt + 1)
 
-        num = self._users[user]
+        return self._users[user]
+
+    def update_locked(self, d, user=None, _allow_val_change=None):
+        """Shallow-update config with `d` and lock config updates on d's keys."""
+        num = self._get_user_id(user)
 
         for k, v in d.items():
             k, v = self._sanitize(k, v, allow_val_change=_allow_val_change)
@@ -217,6 +221,29 @@ class Config:
 
         if self._callback:
             self._callback(data=d)
+
+    def merge_locked(self, d, user=None, _allow_val_change=None):
+        """Recursively merge-update config with `d` and lock config updates on d's keys."""
+        num = self._get_user_id(user)
+        callback_d = {}
+
+        for k, v in d.items():
+            k, v = self._sanitize(k, v, allow_val_change=_allow_val_change)
+            self._locked[k] = num
+
+            if (
+                k in self._items
+                and isinstance(self._items[k], dict)
+                and isinstance(v, dict)
+            ):
+                self._items[k] = config_util.merge_dicts(self._items[k], v)
+            else:
+                self._items[k] = v
+
+            callback_d[k] = self._items[k]
+
+        if self._callback:
+            self._callback(data=callback_d)
 
     def _load_defaults(self):
         conf_dict = config_util.dict_from_config_file("config-defaults.yaml")
@@ -251,20 +278,15 @@ class Config:
         if _is_artifact_representation(val):
             val = self._artifact_callback(key, val)
         # if the user inserts an artifact into the config
-        if not (
-            isinstance(val, wandb.Artifact)
-            or isinstance(val, wandb.apis.public.Artifact)
-        ):
+        if not isinstance(val, wandb.Artifact):
             val = json_friendly_val(val)
         if not allow_val_change:
             if key in self._items and val != self._items[key]:
                 raise config_util.ConfigError(
-                    (
-                        'Attempted to change value of key "{}" '
-                        "from {} to {}\n"
-                        "If you really want to do this, pass"
-                        " allow_val_change=True to config.update()"
-                    ).format(key, self._items[key], val)
+                    f'Attempted to change value of key "{key}" '
+                    f"from {self._items[key]} to {val}\n"
+                    "If you really want to do this, pass"
+                    " allow_val_change=True to config.update()"
                 )
         return key, val
 
@@ -273,8 +295,7 @@ class Config:
         # best if we don't allow nested artifacts until we can lock nested keys in the config
         if isinstance(v, dict) and check_dict_contains_nested_artifact(v, nested):
             raise ValueError(
-                "Instances of wandb.Artifact and wandb.apis.public.Artifact"
-                " can only be top level keys in wandb.config"
+                "Instances of wandb.Artifact can only be top level keys in wandb.config"
             )
 
 

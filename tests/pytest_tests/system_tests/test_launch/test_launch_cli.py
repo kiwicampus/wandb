@@ -1,9 +1,10 @@
 import json
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import wandb
 from wandb.cli import cli
-from wandb.sdk.launch.utils import LaunchError
+from wandb.sdk.launch.errors import LaunchError
 
 REPO_CONST = "test-repo"
 IMAGE_CONST = "fake-image"
@@ -73,7 +74,7 @@ def test_launch_build_succeeds(
 
     monkeypatch.setattr(
         "wandb.cli.cli._launch_add",
-        lambda *args, **kwargs: patched_launch_add(*args, **kwargs),
+        patched_launch_add,
     )
 
     with runner.isolated_filesystem(), relay_server():
@@ -110,13 +111,10 @@ def test_launch_build_fails(
         lambda: None,
     )
 
-    def patched_fetch_and_val(launch_project, _):
-        return launch_project
-
     monkeypatch.setattr(
         wandb.sdk.launch.builder.build,
-        "fetch_and_validate_project",
-        lambda *args, **kwargs: patched_fetch_and_val(*args, **kwargs),
+        "LaunchProject",
+        lambda *args, **kwargs: MagicMock(),
     )
 
     monkeypatch.setattr(
@@ -164,7 +162,7 @@ def test_launch_repository_arg(
         user,
     ]
 
-    def patched_run(
+    async def patched_launch(
         uri,
         job,
         api,
@@ -183,19 +181,23 @@ def test_launch_repository_arg(
     ):
         assert repository or "--repository=" in args or "--repository" in args
 
-        return "run"
+        mock_run = Mock()
+        rv = Mock()
+        rv.state = "finished"
+
+        async def _mock_get_status():
+            return rv
+
+        mock_run.get_status = _mock_get_status
+        return mock_run
 
     monkeypatch.setattr(
-        "wandb.sdk.launch.launch._run",
-        lambda *args, **kwargs: patched_run(*args, **kwargs),
+        "wandb.sdk.launch._launch._launch",
+        patched_launch,
     )
-
-    def patched_fetch_and_val(launch_project, _):
-        return launch_project
-
     monkeypatch.setattr(
-        "wandb.sdk.launch.launch.fetch_and_validate_project",
-        lambda *args, **kwargs: patched_fetch_and_val(*args, **kwargs),
+        "wandb.sdk.launch._launch.LaunchAgent",
+        lambda *args, **kwargs: MagicMock(),
     )
 
     monkeypatch.setattr(
@@ -258,13 +260,10 @@ def test_launch_build_with_local(
         lambda: None,
     )
 
-    def patched_fetch_and_val(launch_project, _):
-        return launch_project
-
     monkeypatch.setattr(
-        wandb.sdk.launch.builder.build,
-        "fetch_and_validate_project",
-        lambda *args, **kwargs: patched_fetch_and_val(*args, **kwargs),
+        wandb.sdk.launch._project_spec,
+        "LaunchProject",
+        lambda *args, **kwargs: MagicMock(),
     )
 
     monkeypatch.setattr(
@@ -291,7 +290,7 @@ def _setup_agent(monkeypatch, pop_func):
 
     monkeypatch.setattr(
         "wandb.sdk.internal.internal_api.Api.create_launch_agent",
-        lambda c, e, p, q, g: {"launchAgentId": "mock_agent_id"},
+        lambda c, e, p, q, a, v, g: {"launchAgentId": "mock_agent_id"},
     )
 
 
@@ -347,7 +346,7 @@ def test_agent_update_failed(runner, monkeypatch, user, test_settings):
 
 
 def test_launch_agent_launch_error_continue(runner, monkeypatch, user, test_settings):
-    def pop_from_run_queue(self, queue):
+    async def pop_from_run_queue(self, queue):
         return {
             "runSpec": {"job": "fake-job:latest"},
             "runQueueItemId": "fakerqi",
@@ -361,11 +360,11 @@ def test_launch_agent_launch_error_continue(runner, monkeypatch, user, test_sett
 
     monkeypatch.setattr(
         "wandb.sdk.launch.agent.LaunchAgent.fail_run_queue_item",
-        lambda c, r: print_then_exit(),
+        lambda c, run_queue_item_id, message, phase, files: print_then_exit(),
     )
     monkeypatch.setattr(
         "wandb.sdk.launch.agent.LaunchAgent.run_job",
-        lambda a, b: raise_(LaunchError("blah blah")),
+        lambda a, b, c, d: raise_(LaunchError("blah blah")),
     )
 
     monkeypatch.setattr(
@@ -391,3 +390,239 @@ def test_launch_agent_launch_error_continue(runner, monkeypatch, user, test_sett
         print(result.output)
         assert "blah blah" in result.output
         assert "except caught, failed item" in result.output
+
+
+@pytest.mark.parametrize(
+    "path,job_type",
+    [
+        ("./test.py", "123"),
+        ("./test.py", ""),
+        (".test.py", "docker"),
+        (".test.py", "repo"),
+    ],
+)
+def test_create_job_bad_type(path, job_type, runner, user):
+    with runner.isolated_filesystem():
+        with open("test.py", "w") as f:
+            f.write("print('hello world')\n")
+
+        with open("requirements.txt", "w") as f:
+            f.write("wandb\n")
+
+        result = runner.invoke(
+            cli.job,
+            ["create", job_type, path, "--entity", user, "--project", "proj"],
+        )
+        print(result.output)
+        assert (
+            "ERROR" in result.output
+            or "Usage: job create [OPTIONS] {git|code|image} PATH" in result.output
+        )
+
+
+def patched_run_run_entry(cmd, dir):
+    print(f"running command: {cmd}")
+    mock_run = Mock()
+    rv = Mock()
+    rv.state = "finished"
+
+    async def _mock_get_status():
+        return rv
+
+    mock_run.get_status = _mock_get_status
+    return mock_run
+
+
+def test_launch_supplied_docker_image(
+    runner,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "wandb.sdk.launch.runner.local_container.pull_docker_image",
+        lambda docker_image: None,
+    )
+    monkeypatch.setattr(
+        "wandb.sdk.launch.runner.local_container.docker_image_exists",
+        lambda docker_image: None,
+    )
+    monkeypatch.setattr(
+        "wandb.sdk.launch.runner.local_container._run_entry_point",
+        patched_run_run_entry,
+    )
+
+    async def _mock_validate_docker_installation():
+        pass
+
+    monkeypatch.setattr(
+        wandb.sdk.launch.builder.build,
+        "validate_docker_installation",
+        _mock_validate_docker_installation,
+    )
+
+    with runner.isolated_filesystem():
+        result = runner.invoke(
+            cli.launch,
+            [
+                "--async",
+                "--docker-image",
+                "test:tag",
+            ],
+        )
+
+    print(result)
+    assert result.exit_code == 0
+    assert "-e WANDB_DOCKER=test:tag" in result.output
+    assert " -e WANDB_CONFIG='{}'" in result.output
+    assert "-e WANDB_ARTIFACTS='{}'" in result.output
+    assert "test:tag" in result.output
+
+
+def test_launch_supplied_logfile(
+    runner, monkeypatch, caplog, wandb_init, test_settings
+):
+    """Test that the logfile is set properly when supplied via the CLI."""
+
+    def patched_pop_empty_queue(self, queue):
+        # patch to no result, agent should read stopPolling and stop
+        return None
+
+    _setup_agent(monkeypatch, patched_pop_empty_queue)
+
+    monkeypatch.setattr(
+        "wandb.sdk.internal.internal_api.Api.get_launch_agent",
+        lambda c, i, g: {"id": "mock_agent_id", "name": "blah", "stopPolling": True},
+    )
+    monkeypatch.setattr(
+        "wandb.sdk.internal.internal_api.Api.update_launch_agent_status",
+        lambda c, i, s, g: {"success": True},
+    )
+
+    with runner.isolated_filesystem():
+        with caplog.at_level("INFO"):
+            result = runner.invoke(
+                cli.launch_agent,
+                [
+                    "--queue=default",
+                    "--log-file=agent.logs",
+                ],
+            )
+
+            assert "Internal agent logs printing to agent.logs" in result.output
+
+            print("Output from cli command:")
+            print(result.output)
+
+            # open agent logs and inspect the contents
+            with open("agent.logs") as f:
+                logs = f.read()
+                print("agent.logs:")
+                print(logs)
+                assert "Internal agent logs printing to agent.logs" in logs
+
+            assert result.exit_code == 0  # Do at the end so we get maximum printing
+
+
+@pytest.mark.parametrize(
+    "command_inputs,expected_error",
+    [
+        (
+            [
+                "--queue=default",
+                "--set-var",
+                "test_str=str1",
+                "--set-var",
+                "test_int=2",
+                "--set-var",
+                "test_num=2.5",
+            ],
+            None,
+        ),
+        (
+            [
+                "--queue=default",
+                "--set-var",
+                "test_str=str1",
+                "--set-var",
+                "test_int=2.5",
+                "--set-var",
+                "test_num=2.5",
+            ],
+            "Value for test_int must be of type integer.",
+        ),
+        (
+            [
+                "--queue=default",
+                "--set-var",
+                "test_str=str1",
+                "--set-var",
+                "test_int=2",
+                "--set-var",
+                "test_num=abc",
+            ],
+            "Value for test_num must be of type number.",
+        ),
+        (
+            [
+                "--queue=default",
+                "--set-var",
+                "illegal_override=3",
+            ],
+            "Queue test-queue does not support overriding illegal_override.",
+        ),
+        (
+            [
+                "--queue=default",
+                "--set-var",
+                "test_str=str1,test_int=2,test_num=2.5",
+            ],
+            '--set-var value must be in the format "--set-var key1=value1", instead got: test_str=str1,test_int=2,test_num=2.5',
+        ),
+    ],
+)
+def test_launch_template_vars(command_inputs, expected_error, runner, monkeypatch):
+    mock_template_variables = [
+        {"name": "test_str", "schema": json.dumps({"type": "string"})},
+        {"name": "test_int", "schema": json.dumps({"type": "integer"})},
+        {"name": "test_num", "schema": json.dumps({"type": "number"})},
+    ]
+    expected_template_variables = {"test_str": "str1", "test_int": 2, "test_num": 2.5}
+
+    def patched_launch_add(*args, **kwargs):
+        # Assert template variables are as expected
+        if not isinstance(args[4], dict) or args[4] != expected_template_variables:
+            raise Exception(args)
+
+    monkeypatch.setattr(
+        "wandb.cli.cli._launch_add",
+        patched_launch_add,
+    )
+
+    def patched_public_api(*args, **kwargs):
+        return Mock()
+
+    monkeypatch.setattr(
+        "wandb.cli.cli.PublicApi",
+        patched_public_api,
+    )
+
+    monkeypatch.setattr("wandb.cli.cli.launch_utils.check_logged_in", lambda _: None)
+
+    def patched_run_queue(*args, **kwargs):
+        mock_rq = Mock()
+        mock_rq.template_variables = mock_template_variables
+        mock_rq.name = "test-queue"
+        return mock_rq
+
+    monkeypatch.setattr(
+        "wandb.cli.cli.RunQueue",
+        patched_run_queue,
+    )
+
+    result = "none"
+    with runner.isolated_filesystem():
+        result = runner.invoke(cli.launch, command_inputs, catch_exceptions=False)
+    if expected_error:
+        assert expected_error in result.output
+        assert result.exit_code == 1
+    else:
+        assert result.exit_code == 0

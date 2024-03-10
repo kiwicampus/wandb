@@ -1,6 +1,6 @@
 """Manage wandb processes.
 
-Create a grpc manager channel.
+Create a manager channel.
 """
 
 import atexit
@@ -14,9 +14,9 @@ from wandb import env, trigger
 from wandb.errors import Error
 from wandb.sdk.lib.exit_hooks import ExitHooks
 from wandb.sdk.lib.import_hooks import unregister_all_post_import_hooks
-from wandb.sdk.lib.proto_util import settings_dict_from_pbmap
 
 if TYPE_CHECKING:
+    from wandb.proto import wandb_settings_pb2
     from wandb.sdk.service import service
     from wandb.sdk.service.service_base import ServiceInterface
     from wandb.sdk.wandb_settings import Settings
@@ -36,7 +36,7 @@ class ManagerConnectionRefusedError(ManagerConnectionError):
 
 class _ManagerToken:
     _version = "2"
-    _supported_transports = {"grpc", "tcp"}
+    _supported_transports = {"tcp"}
     _token_str: str
     _pid: int
     _transport: str
@@ -127,7 +127,6 @@ class _Manager:
             raise ManagerConnectionError(f"Connection to wandb service failed: {e}")
 
     def __init__(self, settings: "Settings") -> None:
-        # TODO: warn if user doesn't have grpc installed
         from wandb.sdk.service import service
 
         self._settings = settings
@@ -135,21 +134,12 @@ class _Manager:
         self._hooks = None
 
         self._service = service._Service(settings=self._settings)
-
-        # Temporary setting to allow use of grpc so that we can keep
-        # that code from rotting during the transition
-        use_grpc = self._settings._service_transport == "grpc"
-
         token = _ManagerToken.from_environment()
         if not token:
             self._service.start()
             host = "localhost"
-            if use_grpc:
-                transport = "grpc"
-                port = self._service.grpc_port
-            else:
-                transport = "tcp"
-                port = self._service.sock_port
+            transport = "tcp"
+            port = self._service.sock_port
             assert port
             token = _ManagerToken.from_params(transport=transport, host=host, port=port)
             token.set_environment()
@@ -203,11 +193,15 @@ class _Manager:
         assert svc_iface
         return svc_iface
 
-    def _inform_init(self, settings: "Settings", run_id: str) -> None:
+    def _inform_init(
+        self, settings: "wandb_settings_pb2.Settings", run_id: str
+    ) -> None:
         svc_iface = self._get_service_interface()
         svc_iface._svc_inform_init(settings=settings, run_id=run_id)
 
-    def _inform_start(self, settings: "Settings", run_id: str) -> None:
+    def _inform_start(
+        self, settings: "wandb_settings_pb2.Settings", run_id: str
+    ) -> None:
         svc_iface = self._get_service_interface()
         svc_iface._svc_inform_start(settings=settings, run_id=run_id)
 
@@ -217,7 +211,7 @@ class _Manager:
             response = svc_iface._svc_inform_attach(attach_id=attach_id)
         except Exception:
             return None
-        return settings_dict_from_pbmap(response._settings_map)
+        return response.settings
 
     def _inform_finish(self, run_id: Optional[str] = None) -> None:
         svc_iface = self._get_service_interface()

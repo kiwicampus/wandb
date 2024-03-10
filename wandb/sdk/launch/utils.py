@@ -1,11 +1,14 @@
 # heavily inspired by https://github.com/mlflow/mlflow/blob/master/mlflow/projects/utils.py
+import asyncio
+import json
 import logging
 import os
 import platform
 import re
 import subprocess
 import sys
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from collections import defaultdict
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
 
 import click
 
@@ -13,8 +16,11 @@ import wandb
 import wandb.docker as docker
 from wandb import util
 from wandb.apis.internal import Api
-from wandb.errors import CommError, Error
+from wandb.errors import CommError
+from wandb.sdk.launch.errors import LaunchError
+from wandb.sdk.launch.git_reference import GitReference
 from wandb.sdk.launch.wandb_reference import WandbReference
+from wandb.sdk.wandb_config import Config
 
 from .builder.templates._wandb_bootstrap import (
     FAILED_PACKAGES_POSTFIX,
@@ -26,31 +32,8 @@ FAILED_PACKAGES_REGEX = re.compile(
 )
 
 if TYPE_CHECKING:  # pragma: no cover
-    from wandb.apis.public import Artifact as PublicArtifact
-
-
-class LaunchError(Error):
-    """Raised when a known error occurs in wandb launch."""
-
-    pass
-
-
-class LaunchDockerError(Error):
-    """Raised when Docker daemon is not running."""
-
-    pass
-
-
-class ExecutionError(Error):
-    """Generic execution exception."""
-
-    pass
-
-
-class SweepError(Error):
-    """Raised when a known error occurs with wandb sweeps."""
-
-    pass
+    from wandb.sdk.artifacts.artifact import Artifact
+    from wandb.sdk.launch.agent.job_status_tracker import JobAndRunStatusTracker
 
 
 # TODO: this should be restricted to just Git repos and not S3 and stuff like that
@@ -69,18 +52,101 @@ _WANDB_LOCAL_DEV_URI_REGEX = re.compile(
     r"^https?://localhost"
 )  # for testing, not sure if we wanna keep this
 
-API_KEY_REGEX = r"WANDB_API_KEY=\w+"
+API_KEY_REGEX = r"WANDB_API_KEY=\w+(-\w+)?"
 
 MACRO_REGEX = re.compile(r"\$\{(\w+)\}")
 
+AZURE_CONTAINER_REGISTRY_URI_REGEX = re.compile(
+    r"(?:https://)?([\w]+)\.azurecr\.io/([\w\-]+):?(.*)"
+)
+
+ELASTIC_CONTAINER_REGISTRY_URI_REGEX = re.compile(
+    r"^(?P<account>.*)\.dkr\.ecr\.(?P<region>.*)\.amazonaws\.com/(?P<repository>.*)/?$"
+)
+
+GCP_ARTIFACT_REGISTRY_URI_REGEX = re.compile(
+    r"^(?P<region>[\w-]+)-docker\.pkg\.dev/(?P<project>[\w-]+)/(?P<repository>[\w-]+)/(?P<image_name>[\w-]+)$",
+    re.IGNORECASE,
+)
+
+S3_URI_RE = re.compile(r"s3://([^/]+)(/(.*))?")
+GCS_URI_RE = re.compile(r"gs://([^/]+)(?:/(.*))?")
+AZURE_BLOB_REGEX = re.compile(
+    r"^https://([^\.]+)\.blob\.core\.windows\.net/([^/]+)/?(.*)$"
+)
+
+
 PROJECT_SYNCHRONOUS = "SYNCHRONOUS"
 
-UNCATEGORIZED_PROJECT = "uncategorized"
 LAUNCH_CONFIG_FILE = "~/.config/wandb/launch-config.yaml"
 LAUNCH_DEFAULT_PROJECT = "model-registry"
 
 _logger = logging.getLogger(__name__)
 LOG_PREFIX = f"{click.style('launch:', fg='magenta')} "
+
+MAX_ENV_LENGTHS: Dict[str, int] = defaultdict(lambda: 32670)
+MAX_ENV_LENGTHS["SageMakerRunner"] = 512
+
+
+def load_wandb_config() -> Config:
+    """Load wandb config from WANDB_CONFIG environment variable(s).
+
+    The WANDB_CONFIG environment variable is a json string that can contain
+    multiple config keys. The WANDB_CONFIG_[0-9]+ environment variables are
+    used for environments where there is a limit on the length of environment
+    variables. In that case, we shard the contents of WANDB_CONFIG into
+    multiple environment variables numbered from 0.
+
+    Returns:
+        A dictionary of wandb config values.
+    """
+    config_str = os.environ.get("WANDB_CONFIG")
+    if config_str is None:
+        config_str = ""
+        idx = 0
+        while True:
+            chunk = os.environ.get(f"WANDB_CONFIG_{idx}")
+            if chunk is None:
+                break
+            config_str += chunk
+            idx += 1
+        if idx < 1:
+            raise LaunchError(
+                "No WANDB_CONFIG or WANDB_CONFIG_[0-9]+ environment variables found"
+            )
+    wandb_config = Config()
+    try:
+        env_config = json.loads(config_str)
+    except json.JSONDecodeError as e:
+        raise LaunchError(f"Failed to parse WANDB_CONFIG: {e}") from e
+
+    wandb_config.update(env_config)
+    return wandb_config
+
+
+def event_loop_thread_exec(func: Any) -> Any:
+    """Wrapper for running any function in an awaitable thread on an event loop.
+
+    Example usage:
+    ```
+    def my_func(arg1, arg2):
+        return arg1 + arg2
+
+    future = event_loop_thread_exec(my_func)(2, 2)
+    assert await future == 4
+    ```
+
+    The returned function must be called within an active event loop.
+    """
+
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        loop = asyncio.get_event_loop()
+        result = cast(
+            Any, await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+        )
+        return result
+
+    return wrapper
 
 
 def _is_wandb_uri(uri: str) -> bool:
@@ -122,7 +188,7 @@ def set_project_entity_defaults(
     project: Optional[str],
     entity: Optional[str],
     launch_config: Optional[Dict[str, Any]],
-) -> Tuple[str, str]:
+) -> Tuple[Optional[str], str]:
     # set the target project and entity if not provided
     source_uri = None
     if uri is not None:
@@ -136,17 +202,34 @@ def set_project_entity_defaults(
         config_project = None
         if launch_config:
             config_project = launch_config.get("project")
-        project = config_project or source_uri or UNCATEGORIZED_PROJECT
+        project = config_project or source_uri or ""
     if entity is None:
-        config_entity = None
-        if launch_config:
-            config_entity = launch_config.get("entity")
-        entity = config_entity or api.default_entity
+        entity = get_default_entity(api, launch_config)
     prefix = ""
     if platform.system() != "Windows" and sys.stdout.encoding == "UTF-8":
         prefix = "🚀 "
-    wandb.termlog(f"{LOG_PREFIX}{prefix}Launching run into {entity}/{project}")
+    wandb.termlog(
+        f"{LOG_PREFIX}{prefix}Launching run into {entity}{'/' + project if project else ''}"
+    )
     return project, entity
+
+
+def get_default_entity(api: Api, launch_config: Optional[Dict[str, Any]]):
+    config_entity = None
+    if launch_config:
+        config_entity = launch_config.get("entity")
+    return config_entity or api.default_entity
+
+
+def strip_resource_args_and_template_vars(launch_spec: Dict[str, Any]) -> None:
+    wandb.termwarn(
+        "Launch spec contains both resource_args and template_variables, "
+        "only one can be set. Using template_variables."
+    )
+    if launch_spec.get("resource_args", None) and launch_spec.get(
+        "template_variables", None
+    ):
+        launch_spec["resource_args"] = None
 
 
 def construct_launch_spec(
@@ -165,6 +248,7 @@ def construct_launch_spec(
     run_id: Optional[str],
     repository: Optional[str],
     author: Optional[str],
+    sweep_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Construct the launch specification from CLI arguments."""
     # override base config (if supplied) with supplied args
@@ -192,6 +276,8 @@ def construct_launch_spec(
         launch_spec["docker"] = {}
     if docker_image:
         launch_spec["docker"]["docker_image"] = docker_image
+    if sweep_id:  # all runs in a sweep have this set
+        launch_spec["sweep_id"] = sweep_id
 
     if "resource" not in launch_spec:
         launch_spec["resource"] = resource if resource else None
@@ -222,6 +308,9 @@ def construct_launch_spec(
             launch_config["registry"]["url"] = repository
         else:
             launch_config["registry"] = {"url": repository}
+
+    # dont send both resource args and template variables
+    strip_resource_args_and_template_vars(launch_spec)
 
     return launch_spec
 
@@ -453,57 +542,22 @@ def _make_refspec_from_version(version: Optional[str]) -> List[str]:
     ]
 
 
-def _fetch_git_repo(dst_dir: str, uri: str, version: Optional[str]) -> str:
+def _fetch_git_repo(dst_dir: str, uri: str, version: Optional[str]) -> Optional[str]:
     """Clones the git repo at ``uri`` into ``dst_dir``.
 
-    checks out commit ``version`` (or defaults to the head commit of the repository's
-    master branch if version is unspecified). Assumes authentication parameters are
+    checks out commit ``version``. Assumes authentication parameters are
     specified by the environment, e.g. by a Git credential helper.
     """
     # We defer importing git until the last moment, because the import requires that the git
     # executable is available on the PATH, so we only want to fail if we actually need it.
-    import git  # type: ignore
 
     _logger.info("Fetching git repo")
-    repo = git.Repo.init(dst_dir)
-    origin = repo.create_remote("origin", uri)
-    refspec = _make_refspec_from_version(version)
-    origin.fetch(refspec=refspec, depth=1)
-
-    if version is not None:
-        try:
-            repo.git.checkout(version)
-        except git.exc.GitCommandError as e:
-            raise LaunchError(
-                f"Unable to checkout version '{version}' of git repo {uri}"
-                "- please ensure that the version exists in the repo. "
-                f"Error: {e}"
-            ) from e
-    else:
-        if getattr(repo, "references", None) is not None:
-            branches = [ref.name for ref in repo.references]
-        else:
-            branches = []
-        # Check if main is in origin, else set branch to master
-        if "main" in branches or "origin/main" in branches:
-            version = "main"
-        else:
-            version = "master"
-
-        try:
-            repo.create_head(version, origin.refs[version])
-            repo.heads[version].checkout()
-            wandb.termlog(
-                f"{LOG_PREFIX}No git branch passed, defaulted to branch: {version}"
-            )
-        except (AttributeError, IndexError) as e:
-            raise LaunchError(
-                f"Unable to checkout default version '{version}' of git repo {uri} "
-                "- to specify a git version use: --git-version \n"
-                f"Error: {e}"
-            ) from e
-
-    repo.submodule_update(init=True, recursive=True)
+    ref = GitReference(uri, version)
+    if ref is None:
+        raise LaunchError(f"Unable to parse git uri: {uri}")
+    ref.fetch(dst_dir)
+    if version is None:
+        version = ref.ref
     return version
 
 
@@ -523,9 +577,17 @@ def convert_jupyter_notebook_to_script(fname: str, project_dir: str) -> str:
     )
 
     _logger.info("Converting notebook to script")
-    new_name = fname.rstrip(".ipynb") + ".py"
+    new_name = fname.replace(".ipynb", ".py")
     with open(os.path.join(project_dir, fname)) as fh:
         nb = nbformat.reads(fh.read(), nbformat.NO_CONVERT)
+        for cell in nb.cells:
+            if cell.cell_type == "code":
+                source_lines = cell.source.split("\n")
+                modified_lines = []
+                for line in source_lines:
+                    if not line.startswith("!"):
+                        modified_lines.append(line)
+                cell.source = "\n".join(modified_lines)
 
     exporter = nbconvert.PythonExporter()
     source, meta = exporter.from_notebook_node(nb)
@@ -537,7 +599,7 @@ def convert_jupyter_notebook_to_script(fname: str, project_dir: str) -> str:
 
 def check_and_download_code_artifacts(
     entity: str, project: str, run_name: str, internal_api: Api, project_dir: str
-) -> Optional["PublicArtifact"]:
+) -> Optional["Artifact"]:
     _logger.info("Checking for code artifacts")
     public_api = wandb.PublicApi(
         overrides={"base_url": internal_api.settings("base_url")}
@@ -579,7 +641,7 @@ def validate_build_and_registry_configs(
         raise LaunchError("registry and build config credential mismatch")
 
 
-def get_kube_context_and_api_client(
+async def get_kube_context_and_api_client(
     kubernetes: Any,
     resource_args: Dict[str, Any],
 ) -> Tuple[Any, Any]:
@@ -587,10 +649,10 @@ def get_kube_context_and_api_client(
     context = None
     if config_file is not None or os.path.exists(os.path.expanduser("~/.kube/config")):
         # context only exist in the non-incluster case
-
-        all_contexts, active_context = kubernetes.config.list_kube_config_contexts(
-            config_file
-        )
+        (
+            all_contexts,
+            active_context,
+        ) = kubernetes.config.list_kube_config_contexts(config_file)
         context = None
         if resource_args.get("context"):
             context_name = resource_args["context"]
@@ -609,8 +671,8 @@ def get_kube_context_and_api_client(
             "awscli is required to load a kubernetes context "
             "from eks. Please run `pip install wandb[launch]` to install it.",
         )
-        kubernetes.config.load_kube_config(config_file, context["name"])
-        api_client = kubernetes.config.new_client_from_config(
+        await kubernetes.config.load_kube_config(config_file, context["name"])
+        api_client = await kubernetes.config.new_client_from_config(
             config_file, context=context["name"]
         )
         return context, api_client
@@ -664,12 +726,23 @@ def make_name_dns_safe(name: str) -> str:
     return resp
 
 
-def warn_failed_packages_from_build_logs(log: str, image_uri: str) -> None:
+def warn_failed_packages_from_build_logs(
+    log: str, image_uri: str, api: Api, job_tracker: Optional["JobAndRunStatusTracker"]
+) -> None:
     match = FAILED_PACKAGES_REGEX.search(log)
     if match:
-        wandb.termwarn(
-            f"Failed to install the following packages: {match.group(1)} for image: {image_uri}. Will attempt to launch image without them."
-        )
+        _msg = f"Failed to install the following packages: {match.group(1)} for image: {image_uri}. Will attempt to launch image without them."
+        wandb.termwarn(_msg)
+        if job_tracker is not None:
+            res = job_tracker.saver.save_contents(
+                _msg, "failed-packages.log", "warning"
+            )
+            api.update_run_queue_item_warning(
+                job_tracker.run_queue_item_id,
+                "Some packages were not successfully installed during the build",
+                "build",
+                res,
+            )
 
 
 def docker_image_exists(docker_image: str, should_raise: bool = False) -> bool:
@@ -690,9 +763,6 @@ def docker_image_exists(docker_image: str, should_raise: bool = False) -> bool:
 
 def pull_docker_image(docker_image: str) -> None:
     """Pull the requested docker image."""
-    if docker_image_exists(docker_image):
-        # don't pull images if they exist already, eg if they are local images
-        return
     try:
         docker.run(["docker", "pull", docker_image])
     except docker.DockerError as e:
@@ -742,3 +812,37 @@ def recursive_macro_sub(source: Any, sub_dict: Dict[str, Optional[str]]) -> Any:
         }
     else:
         return source
+
+
+def fetch_and_validate_template_variables(
+    runqueue: Any, fields: dict
+) -> Dict[str, Any]:
+    template_variables = {}
+
+    variable_schemas = {}
+    for tv in runqueue.template_variables:
+        variable_schemas[tv["name"]] = json.loads(tv["schema"])
+
+    for field in fields:
+        field_parts = field.split("=")
+        if len(field_parts) != 2:
+            raise LaunchError(
+                f'--set-var value must be in the format "--set-var key1=value1", instead got: {field}'
+            )
+        key, val = field_parts
+        if key not in variable_schemas:
+            raise LaunchError(
+                f"Queue {runqueue.name} does not support overriding {key}."
+            )
+        schema = variable_schemas.get(key, {})
+        field_type = schema.get("type")
+        try:
+            if field_type == "integer":
+                val = int(val)
+            elif field_type == "number":
+                val = float(val)
+
+        except ValueError:
+            raise LaunchError(f"Value for {key} must be of type {field_type}.")
+        template_variables[key] = val
+    return template_variables

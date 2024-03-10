@@ -9,6 +9,7 @@ command:
 plugin:
   - wandb
 tag:
+  shard: prodigy
   skips:
     - platform: win
 depend:
@@ -17,6 +18,7 @@ depend:
     - https://github.com/explosion/spacy-models/releases/download/en_core_web_md-3.0.0/en_core_web_md-3.0.0.tar.gz#egg=en_core_web_md
     - Pillow
     - scipy
+    - typing_extensions<4.6.0
   files:
     - file: prodigy_test_resources.zip
       source: https://raw.githubusercontent.com/wandb/wandb-testing/master/test_data/prodigy/prodigy_test_resources.zip
